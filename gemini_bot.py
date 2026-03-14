@@ -7,11 +7,15 @@ from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
 
 # --- KONFIGURATION ---
-# Liest die Daten aus deinen Umgebungsvariablen (.bashrc)
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ALLOWED_USER_ID = int(os.environ.get("TELEGRAM_USER", 0))
 
+# Wir initialisieren das Verzeichnis (kann später per /cd geändert werden)
+CURRENT_PROJECT_DIR = os.environ.get("GEMINI_PROJECT_DIR", os.getcwd())
+
 if not BOT_TOKEN or not ALLOWED_USER_ID:
+# ... (Rest der Prüfung bleibt gleich)
+# ... (Rest der Prüfung)
     print("❌ Fehler: TELEGRAM_TOKEN oder TELEGRAM_USER Umgebungsvariablen nicht gefunden!")
     print("Bitte stelle sicher, dass du 'source ~/.bashrc' ausgeführt hast.")
     exit(1)
@@ -76,7 +80,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=CURRENT_PROJECT_DIR
         )
         
         stdout, stderr = await process.communicate()
@@ -118,21 +123,51 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Zugriff verweigert.")
         await notify_admin_of_unauthorized_access(update, context)
 
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt Infos zum aktuellen Projekt-Verzeichnis."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    await update.message.reply_text(f"📍 *Aktuelles Projekt:* `{CURRENT_PROJECT_DIR}`", parse_mode=ParseMode.MARKDOWN)
+
+async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wechselt das Projektverzeichnis."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    
+    global CURRENT_PROJECT_DIR
+    if not context.args:
+        await update.message.reply_text("Benutzung: `/cd <pfad>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    new_path = " ".join(context.args)
+    # Tilde (~) auflösen
+    new_path = os.path.expanduser(new_path)
+    # Absoluten Pfad berechnen
+    new_path = os.path.abspath(new_path)
+    
+    if os.path.isdir(new_path):
+        CURRENT_PROJECT_DIR = new_path
+        await update.message.reply_text(f"✅ Verzeichnis gewechselt!\n📍 *Neu:* `{CURRENT_PROJECT_DIR}`", parse_mode=ParseMode.MARKDOWN)
+        logging.info(f"📂 Projektverzeichnis gewechselt zu: {CURRENT_PROJECT_DIR}")
+    else:
+        await update.message.reply_text(f"❌ Fehler: Verzeichnis `{new_path}` existiert nicht!", parse_mode=ParseMode.MARKDOWN)
+
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         await notify_admin_of_unauthorized_access(update, context)
         return
 
     try:
-        # Reset via CLI
+        # Reset via CLI im aktuellen Projektverzeichnis
         process = await asyncio.create_subprocess_exec(
             "gemini", "--delete-session", "latest",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=CURRENT_PROJECT_DIR
         )
         await process.communicate()
         await update.message.reply_text("✅ Session gelöscht. Neuer Kontext gestartet.")
-        logging.info("♻ Session Reset durchgeführt.")
+        logging.info(f"♻ Session Reset durchgeführt für {CURRENT_PROJECT_DIR}.")
     except Exception as e:
         await update.message.reply_text(f"❌ Reset fehlgeschlagen: {e}")
 
@@ -140,7 +175,9 @@ if __name__ == '__main__':
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
+    application.add_handler(CommandHandler("info", info_cmd))
+    application.add_handler(CommandHandler("cd", cd_cmd))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    print("Gemini Telegram Bot ist gestartet (Modus: YOLO / Pro)...")
+    print(f"Gemini Telegram Bot ist gestartet (Projekt: {CURRENT_PROJECT_DIR})...")
     application.run_polling()
