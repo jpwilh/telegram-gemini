@@ -3,6 +3,7 @@ import logging
 import subprocess
 import os
 import json
+import signal
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
@@ -17,6 +18,9 @@ MAIN_SESSION_DIR = os.environ.get("BOT_START_DIR", BOT_HOME)
 if not BOT_TOKEN or not ALLOWED_USER_ID:
     print("❌ Fehler: Umgebungsvariablen nicht gefunden!")
     exit(1)
+
+# Globaler Tracker für den laufenden Prozess
+current_process = None
 
 # --- PROJEKT MANAGEMENT ---
 def load_config():
@@ -52,12 +56,26 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 def get_main_keyboard():
     keyboard = [
         [KeyboardButton("📂 Liste"), KeyboardButton("➕ Add")],
-        [KeyboardButton("♻️ Reset"), KeyboardButton("➕ Hilfe")]
+        [KeyboardButton("🛑 Stop"), KeyboardButton("♻️ Reset")],
+        [KeyboardButton("➕ Hilfe")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Befehl oder Nachricht...")
 
 # --- BOT LOGIK ---
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Beendet den aktuell laufenden Prozess."""
+    global current_process
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    
+    if current_process and current_process.returncode is None:
+        current_process.terminate()
+        await update.message.reply_text("🛑 Aktion abgebrochen.", reply_markup=get_main_keyboard())
+        logging.info("🛑 Prozess durch User abgebrochen.")
+    else:
+        await update.message.reply_text("ℹ Keine aktive Aktion zum Abbrechen.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global current_process
     if update.effective_user.id != ALLOWED_USER_ID: return
     
     user_text = update.message.text
@@ -68,8 +86,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text == "♻️ Reset": return await reset_cmd(update, context)
     if user_text == "➕ Hilfe": return await start_cmd(update, context)
     if user_text == "➕ Add": return await add_cmd(update, context)
+    if user_text == "🛑 Stop": return await stop_cmd(update, context)
 
-    # Prüfen, ob dies eine Antwort auf eine Pfad-Anfrage ist
     if update.message.reply_to_message and "Bitte sende mir jetzt den Pfad" in update.message.reply_to_message.text:
         context.args = [user_text]
         return await add_cmd(update, context)
@@ -79,30 +97,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"⏳ Gemini (@{get_project_name(path)})...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        # Erster Versuch: Vorherige Session fortsetzen
+        # Erster Versuch: Resume
         cmd = ["gemini", "-r", "latest", "-o", "text", "--approval-mode", "yolo", "-p", user_text]
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=path)
-        stdout, stderr = await process.communicate()
+        current_process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=path)
+        stdout, stderr = await current_process.communicate()
         
         response_text = stdout.decode().strip()
         error_text = stderr.decode().strip()
 
-        # FALLBACK: Wenn keine vorherige Session existiert, eine neue starten
+        # Fallback für neue Session
         if "No previous sessions found" in error_text:
-            logging.info(f"Keine Session in {path} gefunden, starte neue...")
             cmd = ["gemini", "-o", "text", "--approval-mode", "yolo", "-p", user_text]
-            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=path)
-            stdout, stderr = await process.communicate()
+            current_process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=path)
+            stdout, stderr = await current_process.communicate()
             response_text = stdout.decode().strip()
             error_text = stderr.decode().strip()
 
-        if not response_text and error_text:
+        if current_process.returncode == -signal.SIGTERM or current_process.returncode == 15:
+            response_text = "🛑 Die Aktion wurde abgebrochen."
+        elif not response_text and error_text:
             response_text = f"❌ CLI Fehler:\n{error_text}"
         elif not response_text:
-            response_text = "Erledigt."
+            response_text = "Gemini hat die Aufgabe erledigt."
 
     except Exception as e:
         response_text = f"⚠ Fehler: {str(e)}"
+    finally:
+        current_process = None
 
     parts = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
     for i, part in enumerate(parts):
@@ -166,6 +187,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("list", list_cmd))
     application.add_handler(CommandHandler("add", add_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
+    application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     print("Gemini App-Bot gestartet...")
