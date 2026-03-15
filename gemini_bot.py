@@ -34,7 +34,6 @@ async def post_init(application):
     commands = [
         BotCommand("start", "Bot starten & Hauptmenü"),
         BotCommand("list", "Projektliste anzeigen"),
-        BotCommand("add", "Neues Projekt hinzufügen"),
         BotCommand("reset", "Aktuelle Session löschen"),
         BotCommand("stop", "Laufende Aktion abbrechen"),
         BotCommand("help", "Hilfe & Menü anzeigen")
@@ -90,9 +89,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def get_main_keyboard():
     keyboard = [
-        [KeyboardButton("📂 Liste"), KeyboardButton("➕ Add")],
-        [KeyboardButton("🛑 Stop"), KeyboardButton("♻️ Reset")],
-        [KeyboardButton("➕ Hilfe")]
+        [KeyboardButton("📂 Liste"), KeyboardButton("🛑 Stop")],
+        [KeyboardButton("♻️ Reset"), KeyboardButton("➕ Hilfe")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Befehl oder Nachricht...")
 
@@ -187,8 +185,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text == "📂 Liste": return await list_cmd(update, context)
     if user_text == "♻️ Reset": return await reset_cmd(update, context)
     if user_text == "➕ Hilfe": return await start_cmd(update, context)
-    if user_text == "➕ Add": return await add_cmd(update, context)
     if user_text == "🛑 Stop": return await stop_cmd(update, context)
+
+    # Wenn Nachricht eine Antwort auf "Bitte sende mir jetzt den Pfad" ist:
+    if update.message.reply_to_message and "Pfad" in update.message.reply_to_message.text:
+        path = os.abspath(os.path.expanduser(user_text))
+        if os.path.isdir(path):
+            if path not in config["projects"]:
+                config["projects"].append(path)
+                save_config()
+                await update.message.reply_text(f"✅ Projekt hinzugefügt:\n`{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+            else: await update.message.reply_text("ℹ Bereits vorhanden.", message_thread_id=update.message.message_thread_id)
+        else: await update.message.reply_text(f"❌ Verzeichnis nicht gefunden: `{path}`", message_thread_id=update.message.message_thread_id)
+        return
 
     path = get_active_path(thread_id)
     status_msg = await update.message.reply_text(f"⏳ Gemini ({thread_id}) @ {get_project_name(path)}...", 
@@ -253,17 +262,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🤖 *Gemini Power-Bot*\nVerzeichnis: `{get_active_path(thread_id)}`", 
                                          parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(), message_thread_id=update.message.message_thread_id)
 
-async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID or not context.args: return
-    path = os.abspath(os.path.expanduser(context.args[0]))
-    if os.path.isdir(path):
-        if path not in config["projects"]:
-            config["projects"].append(path)
-            save_config()
-            await update.message.reply_text(f"✅ Projekt hinzugefügt:\n`{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
-        else: await update.message.reply_text("ℹ Bereits vorhanden.", message_thread_id=update.message.message_thread_id)
-    else: await update.message.reply_text(f"❌ Verzeichnis nicht gefunden: `{path}`", message_thread_id=update.message.message_thread_id)
-
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     thread_id = update.message.message_thread_id or "default"
@@ -288,7 +286,6 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", start_cmd))
     application.add_handler(CommandHandler("list", list_cmd))
-    application.add_handler(CommandHandler("add", add_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CallbackQueryHandler(callback_handler))
