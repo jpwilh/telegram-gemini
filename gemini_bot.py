@@ -2,6 +2,8 @@ import asyncio
 import logging
 import subprocess
 import os
+import sys
+import shutil
 import json
 import signal
 import pty
@@ -34,6 +36,7 @@ async def post_init(application):
     commands = [
         BotCommand("start", "Bot starten & Hauptmenü"),
         BotCommand("list", "Projektliste anzeigen"),
+        BotCommand("reload", "Bot Code neu laden"),
         BotCommand("reset", "Aktuelle Session löschen"),
         BotCommand("close", "Topic-Session komplett entfernen"),
         BotCommand("stop", "Laufende Aktion abbrechen"),
@@ -94,7 +97,7 @@ def get_main_keyboard():
         [KeyboardButton("♻️ Reset"), KeyboardButton("🗑 Close")],
         [KeyboardButton("➕ Hilfe")]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Befehl oder Nachricht...")
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Nur Text senden...")
 
 def escape_markdown(text):
     if not text: return ""
@@ -191,7 +194,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text == "🛑 Stop": return await stop_cmd(update, context)
 
     # Wenn Nachricht eine Antwort auf "Bitte sende mir jetzt den Pfad" ist:
-    if update.message.reply_to_message and "Pfad" in update.message.reply_to_message.text:
+    if update.message.reply_to_message and update.message.reply_to_message.text and "Pfad" in update.message.reply_to_message.text:
         path = os.abspath(os.path.expanduser(user_text))
         if os.path.isdir(path):
             if path not in config["projects"]:
@@ -270,12 +273,30 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id or "default"
     process_key = (update.effective_chat.id, thread_id)
     process = active_processes.get(process_key)
+    
     if process and process.returncode is None:
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            await update.message.reply_text("🛑 Aktion abgebrochen.", message_thread_id=update.message.message_thread_id)
-        except: pass
-    else: await update.message.reply_text("ℹ Keine aktive Aktion.", message_thread_id=update.message.message_thread_id)
+            pgid = os.getpgid(process.pid)
+            logging.info(f"🛑 Beende Prozessgruppe {pgid} (Topic {thread_id})")
+            
+            # Erst SIGINT (Strg+C)
+            os.killpg(pgid, signal.SIGINT)
+            
+            # Kurz warten ob er sich beendet
+            for _ in range(4):
+                await asyncio.sleep(0.5)
+                if process.returncode is not None: break
+            
+            # Wenn immer noch da: SIGTERM
+            if process.returncode is None:
+                os.killpg(pgid, signal.SIGTERM)
+                
+            await update.message.reply_text("🛑 Aktion wurde abgebrochen.", message_thread_id=update.message.message_thread_id)
+        except Exception as e:
+            logging.error(f"Fehler beim Stoppen: {e}")
+            await update.message.reply_text(f"❌ Fehler beim Stoppen: {e}", message_thread_id=update.message.message_thread_id)
+    else:
+        await update.message.reply_text("ℹ Keine aktive Aktion.", message_thread_id=update.message.message_thread_id)
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
@@ -283,6 +304,13 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic_home = setup_topic_env(thread_id)
     await asyncio.create_subprocess_exec("rm", "-rf", os.path.join(topic_home, ".gemini", "tmp"))
     await update.message.reply_text(f"♻ Session in *{thread_id}* gelöscht.", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+
+async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    await update.message.reply_text("🔄 Bot wird neu gestartet... Bitte warten.", message_thread_id=update.message.message_thread_id)
+    
+    # Der aktuelle Prozess wird durch einen neuen mit denselben Argumenten ersetzt
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
@@ -293,24 +321,37 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     topic_home = os.path.join(SESSIONS_BASE_DIR, f"topic_{thread_id}")
     if os.path.exists(topic_home):
-        import shutil
         shutil.rmtree(topic_home)
     
     if str(thread_id) in config["topics"]:
         del config["topics"][str(thread_id)]
         save_config()
         
-    await update.message.reply_text(f"🗑 Topic-Session *{thread_id}* wurde vollständig entfernt.", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+    # Versuche das Topic in Telegram zu löschen
+    try:
+        await context.bot.delete_forum_topic(chat_id=update.effective_chat.id, message_thread_id=thread_id)
+        # Bestätigung im Hauptchat (ohne thread_id) senden, falls erfolgreich
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🗑 Topic-Session *{thread_id}* wurde vollständig entfernt und gelöscht.", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logging.error(f"Fehler beim Löschen des Topics {thread_id}: {e}")
+        # Falls Löschen fehlgeschlagen (z.B. keine Berechtigung), antworte normal
+        await update.message.reply_text(f"🗑 Topic-Session *{thread_id}* wurde lokal entfernt, aber das Telegram-Topic konnte nicht gelöscht werden.", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+
+async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    await update.message.reply_text("ℹ Anhänge werden momentan nicht unterstützt. Bitte sende mir deine Aufgabe als Text.")
 
 if __name__ == '__main__':
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", start_cmd))
     application.add_handler(CommandHandler("list", list_cmd))
+    application.add_handler(CommandHandler("reload", reload_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("close", close_cmd))
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_attachment))
     print("Gemini App-Bot gestartet...")
     application.run_polling()
