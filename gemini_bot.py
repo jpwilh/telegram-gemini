@@ -35,6 +35,7 @@ async def post_init(application):
         BotCommand("start", "Bot starten & Hauptmenü"),
         BotCommand("list", "Projektliste anzeigen"),
         BotCommand("reset", "Aktuelle Session löschen"),
+        BotCommand("close", "Topic-Session komplett entfernen"),
         BotCommand("stop", "Laufende Aktion abbrechen"),
         BotCommand("help", "Hilfe & Menü anzeigen")
     ]
@@ -90,7 +91,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 def get_main_keyboard():
     keyboard = [
         [KeyboardButton("📂 Liste"), KeyboardButton("🛑 Stop")],
-        [KeyboardButton("♻️ Reset"), KeyboardButton("➕ Hilfe")]
+        [KeyboardButton("♻️ Reset"), KeyboardButton("🗑 Close")],
+        [KeyboardButton("➕ Hilfe")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Befehl oder Nachricht...")
 
@@ -184,6 +186,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_text == "📂 Liste": return await list_cmd(update, context)
     if user_text == "♻️ Reset": return await reset_cmd(update, context)
+    if user_text == "🗑 Close": return await close_cmd(update, context)
     if user_text == "➕ Hilfe": return await start_cmd(update, context)
     if user_text == "🛑 Stop": return await stop_cmd(update, context)
 
@@ -281,12 +284,31 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.create_subprocess_exec("rm", "-rf", os.path.join(topic_home, ".gemini", "tmp"))
     await update.message.reply_text(f"♻ Session in *{thread_id}* gelöscht.", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
 
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    thread_id = update.message.message_thread_id or "default"
+    if thread_id == "default":
+        await update.message.reply_text("❌ Die Main-Session kann nicht geschlossen werden.", message_thread_id=update.message.message_thread_id)
+        return
+    
+    topic_home = os.path.join(SESSIONS_BASE_DIR, f"topic_{thread_id}")
+    if os.path.exists(topic_home):
+        import shutil
+        shutil.rmtree(topic_home)
+    
+    if str(thread_id) in config["topics"]:
+        del config["topics"][str(thread_id)]
+        save_config()
+        
+    await update.message.reply_text(f"🗑 Topic-Session *{thread_id}* wurde vollständig entfernt.", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+
 if __name__ == '__main__':
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", start_cmd))
     application.add_handler(CommandHandler("list", list_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
+    application.add_handler(CommandHandler("close", close_cmd))
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
