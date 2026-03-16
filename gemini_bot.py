@@ -20,7 +20,7 @@ BOT_HOME = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_JSON = os.path.join(BOT_HOME, "projects.json")
 RELOAD_FILE = os.path.join(BOT_HOME, ".reload_info")
 FINAL_MARKER = "--- ANTWORT ---"
-SYSTEM_INSTRUCTION = f"\n\n(Hinweis: Beende deine Bearbeitung IMMER mit dem Marker '{FINAL_MARKER}' gefolgt von deiner finalen Antwort an den Nutzer. Alles davor wird als interner Denkprozess betrachtet und ausgefiltert.)"
+SYSTEM_INSTRUCTION = f"\n\n(Hinweis: Starte deine finale Antwort an den Nutzer IMMER mit dem Marker '{FINAL_MARKER}'. Alles davor (Denkprozesse, Tool-Aufrufe) wird ausgefiltert.)"
 MAIN_SESSION_DIR = os.environ.get("BOT_START_DIR", BOT_HOME)
 SESSIONS_BASE_DIR = os.path.join(BOT_HOME, "sessions")
 GLOBAL_GEMINI_HOME = os.path.expanduser("~") # Wo die globalen .gemini/ Daten liegen
@@ -131,14 +131,24 @@ def clean_gemini_output(text):
     """Entfernt technische Statusmeldungen und Denkprozesse aus der Antwort."""
     if not text: return ""
     
-    # Falls der Marker vorhanden ist, nehmen wir nur das danach
+    # Falls der Marker vorhanden ist, nehmen wir bevorzugt alles danach.
     if FINAL_MARKER in text:
-        return text.split(FINAL_MARKER)[-1].strip()
+        parts = text.split(FINAL_MARKER)
+        # Wenn nach dem letzten Marker noch nennenswerter Text kommt, nimm den.
+        if len(parts[-1].strip()) > 10:
+            return parts[-1].strip()
+        # Falls der letzte Marker ganz am Ende stand, nimm den Teil davor (die eigentliche Antwort).
+        if len(parts) > 1:
+            return parts[-2].strip()
         
     patterns = [
         r"YOLO mode is enabled\. All tool calls will be automatically approved\.",
         r"Loaded cached credentials\.",
-        r"File .* has been cached"
+        r"File .* has been cached",
+        r"Thinking: .*",
+        r"Calling tool: .*",
+        r"Waiting for tool call result .*",
+        r"Tool result: .*"
     ]
     lines = text.split('\n')
     cleaned_lines = []
@@ -215,6 +225,7 @@ async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
 
     response = "".join(full_output).strip()
     elapsed = int(asyncio.get_event_loop().time() - start_time)
+    logging.info(f"✅ Gemini [{thread_id}] beendet ({elapsed}s, {len(response)} chars, Code {process.returncode})")
     
     try:
         # Finale Antwort für die Statusmeldung extrahieren
