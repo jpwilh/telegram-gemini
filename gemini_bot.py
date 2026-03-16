@@ -6,7 +6,6 @@ import sys
 import shutil
 import json
 import signal
-import pty
 import re
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, BotCommand
 from telegram.constants import ParseMode
@@ -51,7 +50,6 @@ async def post_init(application):
     ]
     await application.bot.set_my_commands(commands)
     
-    # Prüfen, ob der Bot nach einem Reload neu gestartet wurde
     if os.path.exists(RELOAD_FILE):
         try:
             with open(RELOAD_FILE, "r") as f:
@@ -83,13 +81,11 @@ def save_config():
         json.dump(config, f, indent=2)
 
 def setup_topic_env(thread_id):
-    """Bereitet das isolierte GEMINI_CLI_HOME für das Topic vor."""
     topic_home = os.path.join(SESSIONS_BASE_DIR, f"topic_{thread_id}")
     dot_gemini = os.path.join(topic_home, ".gemini")
     
     if not os.path.exists(dot_gemini):
         os.makedirs(dot_gemini)
-        # Symlinks zu globalen Auth-Daten erstellen
         for f in ["oauth_creds.json", "settings.json", "google_accounts.json"]:
             src = os.path.join(GLOBAL_GEMINI_HOME, ".gemini", f)
             dst = os.path.join(dot_gemini, f)
@@ -125,147 +121,107 @@ def escape_markdown(text):
     if not text: return ""
     return text.replace("`", "'")
 
-def clean_gemini_output(text):
-    """Extrahiert die eigentliche Antwort aus dem JSON-Stream oder nutzt Fallback."""
-    if not text: return ""
-    
-    response_parts = []
-    found_json = False
-    
-    for line in text.split('\n'):
-        line = line.strip()
-        if not (line.startswith('{') and line.endswith('}')):
-            continue
-        try:
-            data = json.loads(line)
-            found_json = True
-            if data.get("type") == "message":
-                response_parts.append(data.get("content", ""))
-        except:
-            continue
-            
-    if found_json:
-        return "".join(response_parts).strip()
-        
-    # Fallback für Nicht-JSON Output (z.B. Fehlermeldungen)
-    patterns = [
-        r"YOLO mode is enabled\. All tool calls will be automatically approved\.",
-        r"Loaded cached credentials\.",
-        r"File .* has been cached",
-        r"Thinking: .*",
-        r"Calling tool: .*",
-        r"Waiting for tool call result .*",
-        r"Tool result: .*"
-    ]
-    lines = text.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        if any(re.search(p, line) for p in patterns):
-            continue
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines).strip()
-
 async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
     process_key = (update.effective_chat.id, thread_id)
     topic_home = setup_topic_env(thread_id)
     
     logging.info(f"🚀 Starte Gemini [{thread_id}] in {path}")
-    master_fd, slave_fd = pty.openpty()
     start_time = asyncio.get_event_loop().time()
-    full_output = []
     
-    def read_from_pty():
-        try:
-            data = os.read(master_fd, 8192)
-            if data:
-                text = data.decode(errors='replace')
-                text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
-                full_output.append(text)
-        except Exception: pass
-
-    loop = asyncio.get_event_loop()
-    loop.add_reader(master_fd, read_from_pty)
+    full_response_parts = []
+    last_status_update = 0
+    current_tool = None
+    stderr_buffer = []
 
     env = os.environ.copy()
     env["GEMINI_CLI_HOME"] = topic_home
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=slave_fd, stderr=slave_fd, stdin=slave_fd, cwd=path, 
-            preexec_fn=os.setsid, env=env
-        )
-        os.close(slave_fd)
-        active_processes[process_key] = process
+    process = await asyncio.create_subprocess_exec(
+        *cmd, 
+        stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.PIPE, 
+        cwd=path, 
+        env=env,
+        preexec_fn=os.setsid
+    )
+    active_processes[process_key] = process
+
+    async def update_status():
+        nonlocal last_status_update
+        now = asyncio.get_event_loop().time()
+        if now - last_status_update < 3: return
+        last_status_update = now
         
-        last_update = asyncio.get_event_loop().time()
+        elapsed = int(now - start_time)
+        status_text = f"⏳ *Gemini ({thread_id})* ({elapsed}s)\n\n"
+        
+        if current_tool:
+            status_text += f"🛠 *Tool:* `{current_tool}`\n\n"
+            
+        if full_response_parts:
+            preview = "".join(full_response_parts).strip().split('\n')[-3:]
+            status_text += f"```\n{escape_markdown('\\n'.join(preview))}\n```\n"
+            
+        if stderr_buffer:
+            error_preview = "\n".join([line for line in stderr_buffer if line.strip()][-2:])
+            if error_preview:
+                status_text += f"⚠ *Log/Error:*\n`{escape_markdown(error_preview)}`"
 
-        while process.returncode is None:
-            now = asyncio.get_event_loop().time()
-            if now - last_update > 4:
-                last_update = now
-                elapsed = int(now - start_time)
-                current_text = "".join(full_output)
-                
-                # Versuche aus dem bisherigen Stream den Fortschritt zu lesen
-                status_parts = []
-                current_msg_parts = []
-                for line in current_text.split('\n'):
-                    line = line.strip()
-                    if line.startswith('{') and line.endswith('}'):
-                        try:
-                            d = json.loads(line)
-                            if d.get("type") == "tool_use":
-                                status_parts.append(f"🛠 *Tool:* `{d.get('tool_name')}`")
-                            elif d.get("type") == "message":
-                                current_msg_parts.append(d.get("content", ""))
-                        except: pass
-                
-                # Wenn wir eine Antwort-Vorschau haben, zeige diese
-                if current_msg_parts:
-                    preview = "".join(current_msg_parts).strip().split('\n')[-5:]
-                    clean_lines = escape_markdown("\n".join(preview))
-                    status_text = f"⏳ *Gemini ({thread_id})* ({elapsed}s)\n\n"
-                    if status_parts: status_text += status_parts[-1] + "\n\n"
-                    status_text += f"```\n{clean_lines}\n```"
-                else:
-                    # Fallback auf die letzten Zeilen des Logs
-                    last_lines = current_text.strip().split('\n')[-5:]
-                    clean_lines = escape_markdown("\n".join(last_lines))
-                    status_text = f"⏳ *Gemini ({thread_id})* ({elapsed}s)\n\n"
-                    if clean_lines: status_text += f"```\n{clean_lines}\n```"
-                    else: status_text += "_Warte auf Output..._"
-                
-                try:
-                    await asyncio.wait_for(context.bot.edit_message_text(
-                        chat_id=update.effective_chat.id, message_id=status_msg.message_id, 
-                        text=status_text, parse_mode=ParseMode.MARKDOWN
-                    ), timeout=3.0)
-                except: pass
-            await asyncio.sleep(0.5)
-        await process.wait()
-    finally:
-        loop.remove_reader(master_fd)
-        try: os.close(master_fd)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id, 
+                message_id=status_msg.message_id, 
+                text=status_text, 
+                parse_mode=ParseMode.MARKDOWN
+            )
         except: pass
-        if active_processes.get(process_key) == process: del active_processes[process_key]
 
-    response = "".join(full_output).strip()
-    elapsed = int(asyncio.get_event_loop().time() - start_time)
-    logging.info(f"✅ Gemini [{thread_id}] beendet ({elapsed}s, {len(response)} chars, Code {process.returncode})")
+    async def read_stdout():
+        nonlocal current_tool
+        while True:
+            line = await process.stdout.readline()
+            if not line: break
+            line_text = line.decode(errors='replace').strip()
+            if not line_text: continue
+            
+            try:
+                data = json.loads(line_text)
+                if data.get("type") == "message":
+                    full_response_parts.append(data.get("content", ""))
+                elif data.get("type") == "tool_use":
+                    current_tool = data.get("tool_name")
+                elif data.get("type") == "result":
+                    pass
+                await update_status()
+            except json.JSONDecodeError:
+                stderr_buffer.append(f"STDOUT: {line_text}")
+                await update_status()
+
+    async def read_stderr():
+        while True:
+            line = await process.stderr.readline()
+            if not line: break
+            line_text = line.decode(errors='replace').strip()
+            if line_text:
+                if "Loaded cached credentials" in line_text: continue
+                stderr_buffer.append(line_text)
+                await update_status()
+
+    await asyncio.gather(read_stdout(), read_stderr(), process.wait())
     
+    if active_processes.get(process_key) == process: 
+        del active_processes[process_key]
+
+    final_response = "".join(full_response_parts).strip()
+    elapsed = int(asyncio.get_event_loop().time() - start_time)
+    logging.info(f"✅ Gemini [{thread_id}] beendet ({elapsed}s, Code {process.returncode})")
+    
+    final_status = f"✅ *Gemini fertig!* ({elapsed}s)"
     try:
-        # Finale Antwort für die Statusmeldung extrahieren
-        clean_response = escape_markdown(clean_gemini_output(response))
-        # Nur die letzten 5 Zeilen der sauberen Antwort zeigen, falls zu lang
-        clean_lines = "\n".join(clean_response.split('\n')[-5:])
-        
-        final_status = f"✅ *Gemini fertig!* ({elapsed}s)\n\n"
-        if clean_lines: final_status += f"```\n{clean_lines}\n```"
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=final_status, parse_mode=ParseMode.MARKDOWN)
-    except:
-        try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"✅ Gemini fertig! ({elapsed}s)")
-        except: pass
-    return response, process.returncode
+    except: pass
+    
+    return final_response, process.returncode, "\n".join(stderr_buffer)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
@@ -280,12 +236,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text == "➕ Hilfe": return await start_cmd(update, context)
     if user_text == "🛑 Stop": return await stop_cmd(update, context)
 
-    # Wenn Nachricht eine Antwort auf "Pfad" ist ODER wir gerade darauf warten:
     is_reply_to_add = (update.message.reply_to_message and update.message.reply_to_message.text and "Pfad" in update.message.reply_to_message.text)
     if is_reply_to_add or pending_add.get(user_id):
-        pending_add[user_id] = False # State zurücksetzen
-        
-        # Falls nur ein Name (ohne /) angegeben wurde, im Standard-Verzeichnis anlegen
+        pending_add[user_id] = False
         if "/" not in user_text and "\\" not in user_text:
             path = os.path.join(DEFAULT_PROJECTS_DIR, user_text)
         else:
@@ -294,10 +247,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not os.path.exists(path):
             try:
                 os.makedirs(path)
-                logging.info(f"📁 Verzeichnis neu erstellt: {path}")
                 await update.message.reply_text(f"📁 Verzeichnis neu erstellt: `{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
             except Exception as e:
-                logging.error(f"❌ Fehler beim Erstellen von {path}: {e}")
                 await update.message.reply_text(f"❌ Fehler beim Erstellen von `{path}`: {e}", message_thread_id=update.message.message_thread_id)
                 return
 
@@ -305,13 +256,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if path not in config["projects"]:
                 config["projects"].append(path)
                 save_config()
-                logging.info(f"✅ Projekt hinzugefügt: {path}")
                 await update.message.reply_text(f"✅ Projekt hinzugefügt:\n`{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
             else: 
                 await update.message.reply_text(f"ℹ Bereits vorhanden: `{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
-        else:
-            logging.warning(f"❌ {path} ist kein Verzeichnis.")
-            await update.message.reply_text(f"❌ `{path}` ist kein Verzeichnis.", message_thread_id=update.message.message_thread_id)
         return
 
     path = get_active_path(thread_id)
@@ -319,33 +266,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                  parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
 
     try:
-        # Resume mit 'latest' innerhalb des isolierten topic_home
-        # NUTZE stream-json für saubere Trennung von Logs und Antwort
         cmd = ["gemini", "-r", "latest", "--output-format", "stream-json", "--approval-mode", "yolo", "-p", user_text]
-        response_text, retcode = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
+        response_text, retcode, stderr = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
         
-        # Fallback falls keine Session existiert
-        if retcode != 0 and "No previous sessions found" in response_text:
+        if retcode != 0 and "No previous sessions found" in (response_text + stderr):
             cmd = ["gemini", "--output-format", "stream-json", "--approval-mode", "yolo", "-p", user_text]
-            response_text, retcode = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
+            response_text, retcode, stderr = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
 
-        # Technische Statusmeldungen entfernen
-        response_text = clean_gemini_output(response_text)
-
-        if retcode in [-signal.SIGTERM, 15, -15]: response_text = "🛑 Die Aktion wurde abgebrochen."
-        elif not response_text and retcode != 0: response_text = f"❌ CLI Fehler (Code {retcode})"
-        elif not response_text: response_text = "Gemini hat die Aufgabe erledigt."
-    except Exception as e: response_text = f"⚠ Fehler: {str(e)}"
+        if retcode in [-signal.SIGTERM, 15, -15]: 
+            response_text = "🛑 Die Aktion wurde abgebrochen."
+        elif not response_text:
+            if retcode != 0:
+                response_text = f"❌ CLI Fehler (Code {retcode})\n\n```\n{escape_markdown(stderr[-500:])}\n```"
+            else:
+                response_text = "Gemini hat die Aufgabe erledigt (keine Textantwort)."
+    except Exception as e: 
+        response_text = f"⚠ System-Fehler: {str(e)}"
 
     parts = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
     for i, part in enumerate(parts):
         try:
-            if i == 0: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=part, parse_mode=ParseMode.MARKDOWN)
-            else: await update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+            await update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
         except:
-            try:
-                if i == 0: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=part)
-                else: await update.message.reply_text(part, message_thread_id=update.message.message_thread_id)
+            try: await update.message.reply_text(part, message_thread_id=update.message.message_thread_id)
             except: pass
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,23 +335,14 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if process and process.returncode is None:
         try:
             pgid = os.getpgid(process.pid)
-            logging.info(f"🛑 Beende Prozessgruppe {pgid} (Topic {thread_id})")
-            
-            # Erst SIGINT (Strg+C)
             os.killpg(pgid, signal.SIGINT)
-            
-            # Kurz warten ob er sich beendet
             for _ in range(4):
                 await asyncio.sleep(0.5)
                 if process.returncode is not None: break
-            
-            # Wenn immer noch da: SIGTERM
             if process.returncode is None:
                 os.killpg(pgid, signal.SIGTERM)
-                
             await update.message.reply_text("🛑 Aktion wurde abgebrochen.", message_thread_id=update.message.message_thread_id)
         except Exception as e:
-            logging.error(f"Fehler beim Stoppen: {e}")
             await update.message.reply_text(f"❌ Fehler beim Stoppen: {e}", message_thread_id=update.message.message_thread_id)
     else:
         await update.message.reply_text("ℹ Keine aktive Aktion.", message_thread_id=update.message.message_thread_id)
@@ -423,15 +357,8 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     await update.message.reply_text("🔄 Bot wird neu gestartet... Bitte warten.", message_thread_id=update.message.message_thread_id)
-    
-    # Infos für die Benachrichtigung nach dem Restart speichern
     with open(RELOAD_FILE, "w") as f:
-        json.dump({
-            "chat_id": update.effective_chat.id,
-            "thread_id": update.message.message_thread_id
-        }, f)
-    
-    # Der aktuelle Prozess wird durch einen neuen mit denselben Argumenten ersetzt
+        json.dump({"chat_id": update.effective_chat.id, "thread_id": update.message.message_thread_id}, f)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -440,28 +367,16 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if thread_id == "default":
         await update.message.reply_text("❌ Die Main-Session kann nicht geschlossen werden.", message_thread_id=update.message.message_thread_id)
         return
-    
     topic_home = os.path.join(SESSIONS_BASE_DIR, f"topic_{thread_id}")
-    if os.path.exists(topic_home):
-        shutil.rmtree(topic_home)
-    
+    if os.path.exists(topic_home): shutil.rmtree(topic_home)
     if str(thread_id) in config["topics"]:
         del config["topics"][str(thread_id)]
         save_config()
-        
-    # Versuche das Topic in Telegram zu löschen
     try:
         await context.bot.delete_forum_topic(chat_id=update.effective_chat.id, message_thread_id=thread_id)
-        # Bestätigung im Hauptchat (ohne thread_id) senden, falls erfolgreich
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🗑 Topic-Session *{thread_id}* wurde vollständig entfernt und gelöscht.", parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🗑 Topic-Session *{thread_id}* wurde gelöscht.", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logging.error(f"Fehler beim Löschen des Topics {thread_id}: {e}")
-        # Falls Löschen fehlgeschlagen (z.B. keine Berechtigung), antworte normal
-        await update.message.reply_text(f"🗑 Topic-Session *{thread_id}* wurde lokal entfernt, aber das Telegram-Topic konnte nicht gelöscht werden.", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
-
-async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
-    await update.message.reply_text("ℹ Anhänge werden momentan nicht unterstützt. Bitte sende mir deine Aufgabe als Text.")
+        await update.message.reply_text(f"🗑 Topic-Session *{thread_id}* wurde lokal entfernt.", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).post_init(post_init).build()
@@ -474,6 +389,5 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_attachment))
     logging.info("Gemini App-Bot gestartet...")
     application.run_polling()
