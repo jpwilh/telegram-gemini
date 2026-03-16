@@ -18,6 +18,9 @@ BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ALLOWED_USER_ID = int(os.environ.get("TELEGRAM_USER", 0))
 BOT_HOME = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_JSON = os.path.join(BOT_HOME, "projects.json")
+RELOAD_FILE = os.path.join(BOT_HOME, ".reload_info")
+FINAL_MARKER = "--- ANTWORT ---"
+SYSTEM_INSTRUCTION = f"\n\n(Hinweis: Beende deine Bearbeitung IMMER mit dem Marker '{FINAL_MARKER}' gefolgt von deiner finalen Antwort an den Nutzer. Alles davor wird als interner Denkprozess betrachtet und ausgefiltert.)"
 MAIN_SESSION_DIR = os.environ.get("BOT_START_DIR", BOT_HOME)
 SESSIONS_BASE_DIR = os.path.join(BOT_HOME, "sessions")
 GLOBAL_GEMINI_HOME = os.path.expanduser("~") # Wo die globalen .gemini/ Daten liegen
@@ -31,6 +34,12 @@ if not BOT_TOKEN or not ALLOWED_USER_ID:
 
 # Dictionary für aktive Prozesse pro Topic: {(chat_id, thread_id): process}
 active_processes = {}
+# Merkt sich, welche Nutzer gerade nach einem Pfad gefragt wurden: {user_id: True}
+pending_add = {}
+
+DEFAULT_PROJECTS_DIR = os.path.expanduser("~/ai-projects")
+if not os.path.exists(DEFAULT_PROJECTS_DIR):
+    os.makedirs(DEFAULT_PROJECTS_DIR)
 
 async def post_init(application):
     commands = [
@@ -43,6 +52,21 @@ async def post_init(application):
         BotCommand("help", "Hilfe & Menü anzeigen")
     ]
     await application.bot.set_my_commands(commands)
+    
+    # Prüfen, ob der Bot nach einem Reload neu gestartet wurde
+    if os.path.exists(RELOAD_FILE):
+        try:
+            with open(RELOAD_FILE, "r") as f:
+                info = json.load(f)
+            os.remove(RELOAD_FILE)
+            await application.bot.send_message(
+                chat_id=info["chat_id"], 
+                text="✅ *Bot ist wieder online und einsatzbereit!*", 
+                parse_mode=ParseMode.MARKDOWN,
+                message_thread_id=info.get("thread_id")
+            )
+        except Exception as e:
+            logging.error(f"Fehler beim Senden der Reload-Bestätigung: {e}")
 
 def load_config():
     if os.path.exists(PROJECTS_JSON):
@@ -102,6 +126,27 @@ def get_main_keyboard():
 def escape_markdown(text):
     if not text: return ""
     return text.replace("`", "'")
+
+def clean_gemini_output(text):
+    """Entfernt technische Statusmeldungen und Denkprozesse aus der Antwort."""
+    if not text: return ""
+    
+    # Falls der Marker vorhanden ist, nehmen wir nur das danach
+    if FINAL_MARKER in text:
+        return text.split(FINAL_MARKER)[-1].strip()
+        
+    patterns = [
+        r"YOLO mode is enabled\. All tool calls will be automatically approved\.",
+        r"Loaded cached credentials\.",
+        r"File .* has been cached"
+    ]
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        if any(re.search(p, line) for p in patterns):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
     process_key = (update.effective_chat.id, thread_id)
@@ -172,9 +217,13 @@ async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
     elapsed = int(asyncio.get_event_loop().time() - start_time)
     
     try:
-        clean_response = escape_markdown("\n".join(response.split('\n')[-10:]))
+        # Finale Antwort für die Statusmeldung extrahieren
+        clean_response = escape_markdown(clean_gemini_output(response))
+        # Nur die letzten 5 Zeilen der sauberen Antwort zeigen, falls zu lang
+        clean_lines = "\n".join(clean_response.split('\n')[-5:])
+        
         final_status = f"✅ *Gemini fertig!* ({elapsed}s)\n\n"
-        if clean_response: final_status += f"```\n{clean_response}\n```"
+        if clean_lines: final_status += f"```\n{clean_lines}\n```"
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=final_status, parse_mode=ParseMode.MARKDOWN)
     except:
         try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"✅ Gemini fertig! ({elapsed}s)")
@@ -185,6 +234,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     user_text = update.message.text
     if not user_text: return
+    user_id = update.effective_user.id
     thread_id = update.message.message_thread_id or "default"
     
     if user_text == "📂 Liste": return await list_cmd(update, context)
@@ -193,16 +243,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text == "➕ Hilfe": return await start_cmd(update, context)
     if user_text == "🛑 Stop": return await stop_cmd(update, context)
 
-    # Wenn Nachricht eine Antwort auf "Bitte sende mir jetzt den Pfad" ist:
-    if update.message.reply_to_message and update.message.reply_to_message.text and "Pfad" in update.message.reply_to_message.text:
-        path = os.abspath(os.path.expanduser(user_text))
+    # Wenn Nachricht eine Antwort auf "Pfad" ist ODER wir gerade darauf warten:
+    is_reply_to_add = (update.message.reply_to_message and update.message.reply_to_message.text and "Pfad" in update.message.reply_to_message.text)
+    if is_reply_to_add or pending_add.get(user_id):
+        pending_add[user_id] = False # State zurücksetzen
+        
+        # Falls nur ein Name (ohne /) angegeben wurde, im Standard-Verzeichnis anlegen
+        if "/" not in user_text and "\\" not in user_text:
+            path = os.path.join(DEFAULT_PROJECTS_DIR, user_text)
+        else:
+            path = os.path.abspath(os.path.expanduser(user_text))
+            
+        if not os.path.exists(path):
+            try:
+                os.makedirs(path)
+                logging.info(f"📁 Verzeichnis neu erstellt: {path}")
+                await update.message.reply_text(f"📁 Verzeichnis neu erstellt: `{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+            except Exception as e:
+                logging.error(f"❌ Fehler beim Erstellen von {path}: {e}")
+                await update.message.reply_text(f"❌ Fehler beim Erstellen von `{path}`: {e}", message_thread_id=update.message.message_thread_id)
+                return
+
         if os.path.isdir(path):
             if path not in config["projects"]:
                 config["projects"].append(path)
                 save_config()
+                logging.info(f"✅ Projekt hinzugefügt: {path}")
                 await update.message.reply_text(f"✅ Projekt hinzugefügt:\n`{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
-            else: await update.message.reply_text("ℹ Bereits vorhanden.", message_thread_id=update.message.message_thread_id)
-        else: await update.message.reply_text(f"❌ Verzeichnis nicht gefunden: `{path}`", message_thread_id=update.message.message_thread_id)
+            else: 
+                await update.message.reply_text(f"ℹ Bereits vorhanden: `{path}`", parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
+        else:
+            logging.warning(f"❌ {path} ist kein Verzeichnis.")
+            await update.message.reply_text(f"❌ `{path}` ist kein Verzeichnis.", message_thread_id=update.message.message_thread_id)
         return
 
     path = get_active_path(thread_id)
@@ -210,14 +282,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                  parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
 
     try:
+        # System-Notiz für saubere Antworten anhängen
+        prompt = user_text + SYSTEM_INSTRUCTION
+        
         # Resume mit 'latest' innerhalb des isolierten topic_home
-        cmd = ["gemini", "-r", "latest", "-o", "text", "--approval-mode", "yolo", "-p", user_text]
+        cmd = ["gemini", "-r", "latest", "-o", "text", "--approval-mode", "yolo", "-p", prompt]
         response_text, retcode = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
         
         # Fallback falls keine Session existiert
         if retcode != 0 and "No previous sessions found" in response_text:
-            cmd = ["gemini", "-o", "text", "--approval-mode", "yolo", "-p", user_text]
+            cmd = ["gemini", "-o", "text", "--approval-mode", "yolo", "-p", prompt]
             response_text, retcode = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
+
+        # Technische Statusmeldungen entfernen
+        response_text = clean_gemini_output(response_text)
 
         if retcode in [-signal.SIGTERM, 15, -15]: response_text = "🛑 Die Aktion wurde abgebrochen."
         elif not response_text and retcode != 0: response_text = f"❌ CLI Fehler (Code {retcode})"
@@ -259,7 +337,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config()
         await query.edit_message_text(f"✅ Gewechselt zu: *{get_project_name(get_active_path(thread_id))}* (Topic {thread_id})", parse_mode=ParseMode.MARKDOWN)
     elif query.data == "ask_add":
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="➕ Bitte sende mir jetzt den Pfad:", 
+        pending_add[query.from_user.id] = True
+        await context.bot.send_message(chat_id=update.effective_chat.id, 
+                                       text="➕ Bitte sende mir jetzt den Pfad (absolut) oder einfach einen Namen für ein neues Verzeichnis in `~/ai-projects/`:", 
                                        reply_markup=ForceReply(selective=True), message_thread_id=query.message.message_thread_id)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,6 +389,13 @@ async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     await update.message.reply_text("🔄 Bot wird neu gestartet... Bitte warten.", message_thread_id=update.message.message_thread_id)
     
+    # Infos für die Benachrichtigung nach dem Restart speichern
+    with open(RELOAD_FILE, "w") as f:
+        json.dump({
+            "chat_id": update.effective_chat.id,
+            "thread_id": update.message.message_thread_id
+        }, f)
+    
     # Der aktuelle Prozess wird durch einen neuen mit denselben Argumenten ersetzt
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -353,5 +440,5 @@ if __name__ == '__main__':
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_attachment))
-    print("Gemini App-Bot gestartet...")
+    logging.info("Gemini App-Bot gestartet...")
     application.run_polling()
