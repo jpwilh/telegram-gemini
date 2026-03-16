@@ -19,8 +19,6 @@ ALLOWED_USER_ID = int(os.environ.get("TELEGRAM_USER", 0))
 BOT_HOME = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_JSON = os.path.join(BOT_HOME, "projects.json")
 RELOAD_FILE = os.path.join(BOT_HOME, ".reload_info")
-FINAL_MARKER = "--- ANTWORT ---"
-SYSTEM_INSTRUCTION = f"\n\n(Hinweis: Starte deine finale Antwort an den Nutzer IMMER mit dem Marker '{FINAL_MARKER}'. Alles davor (Denkprozesse, Tool-Aufrufe) wird ausgefiltert.)"
 MAIN_SESSION_DIR = os.environ.get("BOT_START_DIR", BOT_HOME)
 SESSIONS_BASE_DIR = os.path.join(BOT_HOME, "sessions")
 GLOBAL_GEMINI_HOME = os.path.expanduser("~") # Wo die globalen .gemini/ Daten liegen
@@ -128,19 +126,28 @@ def escape_markdown(text):
     return text.replace("`", "'")
 
 def clean_gemini_output(text):
-    """Entfernt technische Statusmeldungen und Denkprozesse aus der Antwort."""
+    """Extrahiert die eigentliche Antwort aus dem JSON-Stream oder nutzt Fallback."""
     if not text: return ""
     
-    # Falls der Marker vorhanden ist, nehmen wir bevorzugt alles danach.
-    if FINAL_MARKER in text:
-        parts = text.split(FINAL_MARKER)
-        # Wenn nach dem letzten Marker noch nennenswerter Text kommt, nimm den.
-        if len(parts[-1].strip()) > 10:
-            return parts[-1].strip()
-        # Falls der letzte Marker ganz am Ende stand, nimm den Teil davor (die eigentliche Antwort).
-        if len(parts) > 1:
-            return parts[-2].strip()
+    response_parts = []
+    found_json = False
+    
+    for line in text.split('\n'):
+        line = line.strip()
+        if not (line.startswith('{') and line.endswith('}')):
+            continue
+        try:
+            data = json.loads(line)
+            found_json = True
+            if data.get("type") == "message":
+                response_parts.append(data.get("content", ""))
+        except:
+            continue
+            
+    if found_json:
+        return "".join(response_parts).strip()
         
+    # Fallback für Nicht-JSON Output (z.B. Fehlermeldungen)
     patterns = [
         r"YOLO mode is enabled\. All tool calls will be automatically approved\.",
         r"Loaded cached credentials\.",
@@ -198,23 +205,42 @@ async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
                 last_update = now
                 elapsed = int(now - start_time)
                 current_text = "".join(full_output)
-                last_lines = current_text.strip().split('\n')[-10:]
                 
-                clean_lines = escape_markdown("\n".join(last_lines))
-                status_text = f"⏳ *Gemini ({thread_id})* ({elapsed}s)\n\n"
-                if clean_lines: status_text += f"```\n{clean_lines}\n```"
-                else: status_text += "_Warte auf Output..._"
+                # Versuche aus dem bisherigen Stream den Fortschritt zu lesen
+                status_parts = []
+                current_msg_parts = []
+                for line in current_text.split('\n'):
+                    line = line.strip()
+                    if line.startswith('{') and line.endswith('}'):
+                        try:
+                            d = json.loads(line)
+                            if d.get("type") == "tool_use":
+                                status_parts.append(f"🛠 *Tool:* `{d.get('tool_name')}`")
+                            elif d.get("type") == "message":
+                                current_msg_parts.append(d.get("content", ""))
+                        except: pass
+                
+                # Wenn wir eine Antwort-Vorschau haben, zeige diese
+                if current_msg_parts:
+                    preview = "".join(current_msg_parts).strip().split('\n')[-5:]
+                    clean_lines = escape_markdown("\n".join(preview))
+                    status_text = f"⏳ *Gemini ({thread_id})* ({elapsed}s)\n\n"
+                    if status_parts: status_text += status_parts[-1] + "\n\n"
+                    status_text += f"```\n{clean_lines}\n```"
+                else:
+                    # Fallback auf die letzten Zeilen des Logs
+                    last_lines = current_text.strip().split('\n')[-5:]
+                    clean_lines = escape_markdown("\n".join(last_lines))
+                    status_text = f"⏳ *Gemini ({thread_id})* ({elapsed}s)\n\n"
+                    if clean_lines: status_text += f"```\n{clean_lines}\n```"
+                    else: status_text += "_Warte auf Output..._"
                 
                 try:
                     await asyncio.wait_for(context.bot.edit_message_text(
                         chat_id=update.effective_chat.id, message_id=status_msg.message_id, 
                         text=status_text, parse_mode=ParseMode.MARKDOWN
                     ), timeout=3.0)
-                except:
-                    try:
-                        plain_text = status_text.replace("*", "").replace("_", "").replace("```", "")
-                        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=plain_text)
-                    except: pass
+                except: pass
             await asyncio.sleep(0.5)
         await process.wait()
     finally:
@@ -293,16 +319,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                  parse_mode=ParseMode.MARKDOWN, message_thread_id=update.message.message_thread_id)
 
     try:
-        # System-Notiz für saubere Antworten anhängen
-        prompt = user_text + SYSTEM_INSTRUCTION
-        
         # Resume mit 'latest' innerhalb des isolierten topic_home
-        cmd = ["gemini", "-r", "latest", "-o", "text", "--approval-mode", "yolo", "-p", prompt]
+        # NUTZE stream-json für saubere Trennung von Logs und Antwort
+        cmd = ["gemini", "-r", "latest", "--output-format", "stream-json", "--approval-mode", "yolo", "-p", user_text]
         response_text, retcode = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
         
         # Fallback falls keine Session existiert
         if retcode != 0 and "No previous sessions found" in response_text:
-            cmd = ["gemini", "-o", "text", "--approval-mode", "yolo", "-p", prompt]
+            cmd = ["gemini", "--output-format", "stream-json", "--approval-mode", "yolo", "-p", user_text]
             response_text, retcode = await run_gemini_command(cmd, path, update, context, status_msg, thread_id)
 
         # Technische Statusmeldungen entfernen
