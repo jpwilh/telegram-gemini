@@ -2,7 +2,6 @@ import asyncio, logging, os, sys, shutil, json, signal, re, html
 from telegram import Update, ForceReply, BotCommand, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
-from telegram.error import TelegramError
 
 # --- KONFIGURATION ---
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -14,14 +13,15 @@ SESSIONS_BASE_DIR = os.path.join(BOT_HOME, "sessions")
 GLOBAL_GEMINI_HOME = os.path.expanduser("~") 
 DEFAULT_PROJECTS_DIR = os.path.expanduser("~/ai-projects")
 
-os.makedirs(SESSIONS_BASE_DIR, exist_ok=True)
-os.makedirs(DEFAULT_PROJECTS_DIR, exist_ok=True)
+for d in [SESSIONS_BASE_DIR, DEFAULT_PROJECTS_DIR]: os.makedirs(d, exist_ok=True)
 
 if not BOT_TOKEN or not ALLOWED_USER_ID:
-    print("❌ Fehler: Umgebungsvariablen nicht gefunden!")
-    exit(1)
+    print("❌ Fehler: Umgebungsvariablen (TOKEN/USER) fehlen!"); exit(1)
 
+# Globaler State
 active_processes = {}
+active_status_messages = {}
+stop_flags = {}
 pending_add = {}
 
 def load_config():
@@ -40,17 +40,24 @@ def save_config():
 def escape_html(text): return html.escape(str(text)) if text else ""
 
 def get_main_keyboard():
-    keyboard = [
+    return ReplyKeyboardMarkup([
         [KeyboardButton("📂 Liste"), KeyboardButton("🆕 Neu")],
         [KeyboardButton("🛑 Stop"), KeyboardButton("♻️ Reset")],
         [KeyboardButton("🗑 Close"), KeyboardButton("➕ Hilfe")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    ], resize_keyboard=True)
 
-def get_active_project(thread_id):
-    for p in config["projects"]:
-        if str(p.get("thread_id")) == str(thread_id): return p
-    return None
+async def post_init(application):
+    logging.info("🚀 Bot-Initialisierung...")
+    # Chat-ID Reload Bestätigung
+    if os.path.exists(RELOAD_FILE):
+        try:
+            with open(RELOAD_FILE, "r") as f: info = json.load(f)
+            os.remove(RELOAD_FILE)
+            await application.bot.send_message(chat_id=info["chat_id"], text="✅ <b>Online!</b>", 
+                                             parse_mode=ParseMode.HTML, message_thread_id=info.get("thread_id"))
+        except: pass
+    # Topic Sync
+    await sync_topics(application)
 
 async def sync_topics(application):
     chat_id = config.get("chat_id")
@@ -63,41 +70,16 @@ async def sync_topics(application):
                 p["thread_id"] = topic.message_thread_id
                 changed = True
                 await application.bot.send_message(chat_id=chat_id, message_thread_id=p["thread_id"],
-                                                 text=f"🚀 Projekt <b>{escape_html(p['name'])}</b> bereit.", parse_mode=ParseMode.HTML)
-            except Exception as e: 
-                logging.error(f"Sync error for {p['name']}: {e}")
-                if "Not enough rights" in str(e):
-                    await application.bot.send_message(chat_id=chat_id, text="❌ <b>Rechte fehlen:</b> Der Bot darf keine Topics erstellen.")
-                    return
+                    text=f"🚀 Projekt <b>{escape_html(p['name'])}</b> bereit.", parse_mode=ParseMode.HTML)
+            except Exception as e: logging.error(f"Sync error: {e}")
     if changed: save_config()
-
-async def post_init(application):
-    logging.info("🚀 Bot-Initialisierung...")
-    commands = [
-        BotCommand("start", "Menü"),
-        BotCommand("new", "Neu"),
-        BotCommand("list", "Liste"),
-        BotCommand("reload", "Reload"),
-        BotCommand("reset", "Reset"),
-        BotCommand("close", "Close"),
-        BotCommand("stop", "Stop"),
-        BotCommand("help", "Hilfe")
-    ]
-    await application.bot.set_my_commands(commands)
-    await sync_topics(application)
-    
-    if os.path.exists(RELOAD_FILE):
-        try:
-            with open(RELOAD_FILE, "r") as f: info = json.load(f)
-            os.remove(RELOAD_FILE)
-            await application.bot.send_message(chat_id=info["chat_id"], text="✅ <b>Online!</b>", 
-                                             parse_mode=ParseMode.HTML, message_thread_id=info.get("thread_id"))
-        except: pass
 
 async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
     topic_home = os.path.join(SESSIONS_BASE_DIR, f"topic_{thread_id or 'main'}")
     dot_gemini = os.path.join(topic_home, ".gemini")
     os.makedirs(dot_gemini, exist_ok=True)
+    
+    # Auth-Links sicherstellen
     for f in ["oauth_creds.json", "settings.json", "google_accounts.json"]:
         src, dst = os.path.join(GLOBAL_GEMINI_HOME, ".gemini", f), os.path.join(dot_gemini, f)
         if os.path.exists(src) and not os.path.exists(dst):
@@ -105,18 +87,21 @@ async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
             except: pass
 
     start_time = asyncio.get_event_loop().time()
+    last_activity = start_time
     full_resp, last_upd, current_tool, stderr_buffer = [], 0, None, []
-    env = os.environ.copy()
-    env["GEMINI_CLI_HOME"] = topic_home
-
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, 
-                                                   cwd=path, env=env, preexec_fn=os.setsid)
+    
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.PIPE, cwd=path, env={**os.environ, "GEMINI_CLI_HOME": topic_home}, preexec_fn=os.setsid)
+    
     active_processes[thread_id] = process
+    stop_flags[thread_id] = False
+    timed_out = False
 
-    async def update_status():
+    async def update_status(force=False):
         nonlocal last_upd
+        if stop_flags.get(thread_id): return
         now = asyncio.get_event_loop().time()
-        if (now - last_upd < 4): return 
+        if not force and (now - last_upd < 4): return 
         last_upd = now
         elapsed = int(now - start_time)
         txt = f"⏳ <b>Gemini ({escape_html(thread_id or 'main')})</b> ({elapsed}s)\n\n"
@@ -130,31 +115,44 @@ async def run_gemini_command(cmd, path, update, context, status_msg, thread_id):
         try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=txt, parse_mode=ParseMode.HTML)
         except: pass
 
-    async def read_stdout():
-        nonlocal current_tool
-        while True:
-            line = await process.stdout.readline()
-            if not line: break
-            try:
-                data = json.loads(line.decode(errors='replace'))
-                if data.get("type") == "message" and data.get("role") == "assistant":
-                    full_resp.append(data.get("content", ""))
-                elif data.get("type") == "tool_use": current_tool = data.get("tool_name")
-                await update_status()
-            except: pass
+    async def watchdog():
+        nonlocal timed_out
+        while process.returncode is None:
+            await asyncio.sleep(5)
+            if asyncio.get_event_loop().time() - last_activity > 300:
+                try: os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except: pass
+                timed_out = True; break
+            await update_status()
 
-    async def read_stderr():
+    async def read_stream(stream, is_stderr=False):
+        nonlocal current_tool, last_activity
         while True:
-            line = await process.stderr.readline()
+            line = await stream.readline()
             if not line: break
-            t = line.decode(errors='replace').strip()
-            if t and not any(x in t for x in ["cached credentials", "YOLO mode"]):
-                stderr_buffer.append(t)
-                await update_status()
+            last_activity = asyncio.get_event_loop().time()
+            text = line.decode(errors='replace').strip()
+            if is_stderr:
+                if text and not any(x in text for x in ["cached credentials", "YOLO mode"]):
+                    stderr_buffer.append(text)
+            else:
+                try:
+                    data = json.loads(text)
+                    if data.get("type") == "message" and data.get("role") == "assistant":
+                        full_resp.append(data.get("content", ""))
+                    elif data.get("type") == "tool_use": current_tool = data.get("tool_name")
+                except: pass
+            await update_status()
 
-    await asyncio.gather(read_stdout(), read_stderr(), process.wait())
+    wd_task = asyncio.create_task(watchdog())
+    await asyncio.gather(read_stream(process.stdout), read_stream(process.stderr, True), process.wait())
+    wd_task.cancel()
+    
     if thread_id in active_processes: del active_processes[thread_id]
-    return "".join(full_resp).strip(), process.returncode, "\n".join(stderr_buffer)
+    
+    res = "".join(full_resp).strip()
+    if timed_out: res = "❌ <b>Abbruch:</b> Inaktivitäts-Timeout (5 Min)."
+    return res, process.returncode, "\n".join(stderr_buffer)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ALLOWED_USER_ID: return
@@ -162,21 +160,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text: return
     
     if config["chat_id"] != update.effective_chat.id:
-        config["chat_id"] = update.effective_chat.id
-        save_config()
+        config["chat_id"] = update.effective_chat.id; save_config()
         await sync_topics(context.application)
 
+    # Projekt-Anlage
     if pending_add.get(update.effective_user.id):
         pending_add[update.effective_user.id] = False
         path = os.path.join(DEFAULT_PROJECTS_DIR, user_text)
-        os.makedirs(path, exist_ok=True)
-        topic = await context.bot.create_forum_topic(chat_id=update.effective_chat.id, name=user_text)
-        config["projects"].append({"path": path, "name": user_text, "thread_id": topic.message_thread_id})
-        save_config()
-        await context.bot.send_message(chat_id=update.effective_chat.id, message_thread_id=topic.message_thread_id,
-                                       text=f"✅ Projekt <b>{escape_html(user_text)}</b> erstellt.", parse_mode=ParseMode.HTML)
+        try:
+            os.makedirs(path, exist_ok=True)
+            topic = await context.bot.create_forum_topic(chat_id=update.effective_chat.id, name=user_text)
+            config["projects"].append({"path": path, "name": user_text, "thread_id": topic.message_thread_id})
+            save_config()
+            await context.bot.send_message(chat_id=update.effective_chat.id, message_thread_id=topic.message_thread_id,
+                text=f"✅ Projekt <b>{escape_html(user_text)}</b> bereit.", parse_mode=ParseMode.HTML)
+        except Exception as e: await update.message.reply_text(f"❌ Fehler: {e}")
         return
 
+    # Buttons / Kommandos
     if user_text == "📂 Liste": return await list_cmd(update, context)
     if user_text == "🆕 Neu": return await new_cmd(update, context)
     if user_text == "🛑 Stop": return await stop_cmd(update, context)
@@ -184,79 +185,102 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text == "🗑 Close": return await close_cmd(update, context)
     if user_text == "➕ Hilfe": return await help_cmd(update, context)
 
-    proj = get_active_project(tid)
+    # Concurrency Check
+    if tid in active_processes:
+        return await update.message.reply_text("⏳ <b>Gemini arbeitet noch...</b>", parse_mode=ParseMode.HTML)
+
+    proj = next((p for p in config["projects"] if str(p.get("thread_id")) == str(tid)), None)
     path = proj["path"] if proj else BOT_HOME
-    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="⏳ Thinking...", message_thread_id=tid)
-
-    cmd = ["gemini", "-r", "latest", "--output-format", "stream-json", "--approval-mode", "yolo", "-p", user_text]
-    resp, code, err = await run_gemini_command(cmd, path, update, context, status_msg, tid)
-    if code != 0 and "No previous sessions found" in (resp + err):
-        cmd = ["gemini", "--output-format", "stream-json", "--approval-mode", "yolo", "-p", user_text]
-        resp, code, err = await run_gemini_command(cmd, path, update, context, status_msg, tid)
-
-    if not resp: resp = "Done." if code == 0 else f"❌ Error ({code})\n<pre>{escape_html(err[-500:])}</pre>"
     
-    parts = [resp[i:i+4000] for i in range(0, len(resp), 4000)]
-    for i, part in enumerate(parts):
-        if i == 0:
-            try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=part, parse_mode=ParseMode.MARKDOWN)
-            except: 
-                try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=part)
-                except: pass
-        else:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=part, message_thread_id=tid)
+    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="⏳ Gemini denkt nach...", message_thread_id=tid)
+    active_status_messages[tid] = status_msg
 
-# --- COMMANDS ---
+    try:
+        cmd_base = ["gemini", "-r", "latest", "--output-format", "stream-json", "--approval-mode", "yolo", "-p", user_text]
+        resp, code, err = await run_gemini_command(cmd_base, path, update, context, status_msg, tid)
+        
+        if code != 0 and not stop_flags.get(tid) and not resp.startswith("❌") and "No previous sessions found" in (resp + err):
+            resp, code, err = await run_gemini_command(cmd_base[2:], path, update, context, status_msg, tid)
+
+        if stop_flags.get(tid): return
+
+        if not resp:
+            resp = "✅ Erledigt." if code == 0 else f"❌ Fehler ({code})\n<pre>{escape_html(err[-500:])}</pre>"
+    except Exception as e: 
+        if stop_flags.get(tid): return
+        resp = f"⚠ System-Fehler: {escape_html(str(e))}"
+    finally:
+        active_status_messages.pop(tid, None)
+        stop_flags.pop(tid, None)
+
+    # Antwort senden
+    if tid not in active_processes: # Zusätzlicher Check ob nicht gerade ein neues /stop kam
+        parts = [resp[i:i+4000] for i in range(0, len(resp), 4000)]
+        for i, part in enumerate(parts):
+            if i == 0:
+                txt = f"✅ {part}" if not any(part.startswith(x) for x in ["✅", "❌", "⚠"]) else part
+                try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, 
+                    text=txt, parse_mode=ParseMode.MARKDOWN)
+                except: 
+                    try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, 
+                        text=escape_html(txt), parse_mode=ParseMode.HTML)
+                    except: pass
+            else:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=part, message_thread_id=tid)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ALLOWED_USER_ID:
-        await update.message.reply_text("🤖 <b>Bot ready.</b>", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+        await update.message.reply_text("🤖 <b>Gemini Bot bereit.</b>", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ALLOWED_USER_ID:
-        msg = "<b>Commands:</b> /new, /list, /reset, /stop, /close, /reload"
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
-
-async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
-    pending_add[update.effective_user.id] = True
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="➕ Name?", reply_markup=ForceReply(selective=True), message_thread_id=update.message.message_thread_id)
-
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
-    msg = "📂 <b>Projects:</b>\n" + "\n".join([f"• {p['name']} ({p['thread_id']})" for p in config["projects"]])
-    await update.message.reply_text(msg or "None.", parse_mode=ParseMode.HTML)
-
-async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
-    tid = update.message.message_thread_id
-    if not tid: return
-    proj = next((p for p in config["projects"] if str(p["thread_id"]) == str(tid)), None)
-    if proj:
-        config["projects"].remove(proj); save_config()
-        if os.path.exists(os.path.join(SESSIONS_BASE_DIR, f"topic_{tid}")): shutil.rmtree(os.path.join(SESSIONS_BASE_DIR, f"topic_{tid}"))
-        try: await context.bot.delete_forum_topic(chat_id=update.effective_chat.id, message_thread_id=tid)
-        except: pass
+        await update.message.reply_text("<b>Befehle:</b> /new, /list, /reset, /stop, /close, /reload", parse_mode=ParseMode.HTML)
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
     tid = update.message.message_thread_id
-    if tid in active_processes:
-        try: os.killpg(os.getpgid(active_processes[tid].pid), signal.SIGINT)
+    process = active_processes.get(tid)
+    if process and process.returncode is None:
+        stop_flags[tid] = True
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGINT)
+            await asyncio.sleep(0.5)
+            if process.returncode is None: os.killpg(os.getpgid(process.pid), signal.SIGKILL)
         except: pass
+        msg = active_status_messages.pop(tid, None)
+        if msg:
+            try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text="🛑 <b>Abgebrochen.</b>", parse_mode=ParseMode.HTML)
+            except: pass
+    else: await update.message.reply_text("ℹ Keine aktive Aktion.")
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
     tid = update.message.message_thread_id
     d = os.path.join(SESSIONS_BASE_DIR, f"topic_{tid or 'main'}", ".gemini", "tmp")
     if os.path.exists(d): shutil.rmtree(d)
-    await update.message.reply_text("♻ Reset.", message_thread_id=tid)
+    await update.message.reply_text("♻ Session gelöscht.", message_thread_id=tid)
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
-    await update.message.reply_text("🔄 Reloading...", message_thread_id=update.message.message_thread_id)
+    await update.message.reply_text("🔄 Reload..."); save_config()
     with open(RELOAD_FILE, "w") as f: json.dump({"chat_id": update.effective_chat.id, "thread_id": update.message.message_thread_id}, f)
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = "📂 <b>Projekte:</b>\n" + "\n".join([f"• {p['name']} ({p['thread_id']})" for p in config["projects"]])
+    await update.message.reply_text(msg or "Keine Projekte.", parse_mode=ParseMode.HTML)
+
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.message.message_thread_id
+    if not tid: return
+    proj = next((p for p in config["projects"] if str(p.get("thread_id")) == str(tid)), None)
+    if proj:
+        config["projects"].remove(proj); save_config()
+        shutil.rmtree(os.path.join(SESSIONS_BASE_DIR, f"topic_{tid}"), ignore_errors=True)
+        try: await context.bot.delete_forum_topic(chat_id=update.effective_chat.id, message_thread_id=tid)
+        except: pass
+
+async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending_add[update.effective_user.id] = True
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="➕ Name für neues Projekt?", 
+        reply_markup=ForceReply(selective=True), message_thread_id=update.message.message_thread_id)
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
